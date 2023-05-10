@@ -2,7 +2,7 @@ from airflow import DAG
 from airflow.operators.python_operator import PythonOperator
 from datetime import datetime
 from minio import Minio
-import pandas as pd
+import pandas as pd, glob, os, airflow.utils.dates, sys
 import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -10,104 +10,142 @@ from airflow.providers.postgres.operators.postgres import PostgresOperator
 from airflow.hooks.postgres_hook import PostgresHook
 from botocore.exceptions import ClientError
 
-# Minio configuration
-MINIO_HOST = 'minio_host'
-MINIO_ACCESS_KEY = 'minio_access_key'
-MINIO_SECRET_KEY = 'minio_secret_key'
-MINIO_BUCKET = 'minio_bucket'
-MINIO_PREFIX = 'minio_prefix/'
+# Create Minio client
+minio_client = Minio(
+    "docker-minio:9000",
+    access_key="F27De9ca8pOR4LG1",
+    secret_key="mEwGTU3F2VHMClMYzU35ju52WrCdf8f0",
+    secure=False
+)
 
-# PostgreSQL configuration
-POSTGRES_CONN_ID = 'postgres_conn_id'
-POSTGRES_TABLE = 'postgres_table'
+bucket_name = "bucket-bucket"
 
-def read_csv_from_minio():
-    # Connect to Minio
-    client = Minio(
-        MINIO_HOST,
-        access_key=MINIO_ACCESS_KEY,
-        secret_key=MINIO_SECRET_KEY,
-        secure=False
-    )
+conn = PostgresHook(postgres_conn_id='postgre_airflow').get_conn()
+cursor = conn.cursor()
 
-    # Download the latest CSV file
-    objects = client.list_objects(MINIO_BUCKET, prefix=MINIO_PREFIX)
-    latest_object = max(objects, key=lambda x: x.last_modified)
-    file_path = '/tmp/' + latest_object.object_name.split('/')[-1]
-    client.fget_object(MINIO_BUCKET, latest_object.object_name, file_path)
+# The mail addresses and password
+sender_address = 'ahmadfadilfatanm@gmail.com'
+receiver_address = 'ahmadfadilfatanm@gmail.com'
+appPassword = 'dqxacxokawmpxufw'
 
-    # Read the CSV file
-    df = pd.read_csv(file_path)
+def format_currency(number):
+    currency = str(number)
 
-    return df
+    if len(currency) <= 3:
+        return 'Rp '+ currency
+    else:
+        start = currency[-3:]
+        end = currency[:-3]
 
-def insert_data_to_postgres():
-    # Read the CSV file from Minio
-    df = read_csv_from_minio()
+    return format_currency(end) + '.' + start
 
-    # Connect to PostgreSQL
-    pg_hook = PostgresHook(postgres_conn_id=POSTGRES_CONN_ID)
+def upload_to_minio():
+    objects = minio_client.list_objects(bucket_name, recursive=True)
 
-    # Create the table if not exists
-    pg_hook.run(f"""
-        CREATE TABLE IF NOT EXISTS {POSTGRES_TABLE} (
-            sku VARCHAR NOT NULL PRIMARY KEY,
-            sold INTEGER NOT NULL,
-            price INTEGER NOT NULL,
-            baseprice INTEGER NOT NULL
-        )
-    """)
+    countFile = 0
+    arrFile = []
+    for obj in objects:
+        arrFile.append(obj.object_name)
 
-    # Insert the data into the table
-    for index, row in df.iterrows():
-        sku = row['sku']
-        sold = row['sold']
-        price = row['price']
-        baseprice = row['baseprice']
-        pg_hook.run(f"""
-            INSERT INTO {POSTGRES_TABLE} (sku, sold, price, baseprice)
-            VALUES ('{sku}', {sold}, {price}, {baseprice})
-            ON CONFLICT (sku) DO UPDATE SET sold = excluded.sold, price = excluded.price, baseprice = excluded.baseprice
-        """)
+    countFile = len(arrFile)
+    
+    if countFile < 1:
+        # Upload file to Minio
+        minio_client.fput_object("bucket-bucket", "scanner_data.csv", "/opt/airflow/dags/scanner_data.csv")
+        print("Berhasil mengupload file. . .")
+    else:
+        print("Sudah ada file pada server minio. . .")
 
-    print('Data berhasil disimpan di PostgreSQL')
+def download_from_minio():
+    objects = minio_client.list_objects(bucket_name, recursive=True)
+
+    countFile = 0
+    arrFile = []
+    for obj in objects:
+        arrFile.append(obj.object_name)
+
+    countFile = len(arrFile)
+    
+    if countFile < 1:
+        print("Tidak ada file yang didownload. . .")
+    else:
+        # Download file from Minio
+        minio_client.fget_object("bucket-bucket", "scanner_data.csv", "/opt/airflow/dags/scanner_data.csv")
+        print("Berhasil mendownload file. . .")
+    
+def read_from_minio():
+    objects = minio_client.list_objects(bucket_name, recursive=True)
+    
+    for obj in objects:
+        # Read file from Minio
+        response = minio_client.get_object(obj.bucket_name, obj.object_name)
+
+        df = pd.read_csv(response)
+
+        for index, row in df.iterrows():
+            cursor.execute('SELECT * FROM project_sales where sku = %s', (row["sku"],))
+            countRows   = cursor.rowcount
+
+            if countRows < 1:
+                insert_data(row["sku"], row["sold"], row["price"], row["baseprice"])
+            else:
+                print("SKU "+row['sku']+" Data Sudah Ada")        
+
+def insert_data(sku, sold, price, baseprice):
+    params = (sku, sold, price, baseprice)
+
+    cursor.execute("INSERT INTO project_sales (sku, sold, price, baseprice) VALUES (%s, %s, %s, %s)", params)
+    conn.commit()
+    print("Data Telah Di Insert")
+
+def parsing_data():
+    print("Data Telah di Parsing.")
+
+    cursor.execute('SELECT * FROM project_sales')
+    result = cursor.fetchall()
+
+    sold = []
+    price = []
+    baseprice = []
+    
+    for res in result:
+        sold.append(res[1])
+        price.append(res[2])
+        baseprice.append(res[3])
+
+    return sold, price, baseprice
+
 
 def send_email():
-    # Connect to PostgreSQL
-    pg_hook = PostgresHook(postgres_conn_id=POSTGRES_CONN_ID)
+    response = parsing_data()
+    
+    jumlah_sold = sum(response[0])
+    jumlah_price = sum(response[1])
+    jumlah_baseprice = sum(response[2])
 
-    # Read the data from the table
-    rows = pg_hook.get_records(f"""
-        SELECT SUM(sold), SUM(price), SUM(baseprice)
-        FROM {POSTGRES_TABLE}
-    """)
+    profit = jumlah_sold * (jumlah_price - jumlah_baseprice)
 
-    # Calculate the profit
-    total_sold = rows[0][0]
-    total_price = rows[0][1]
-    total_baseprice = rows[0][2]
-    profit = total_sold * (total_price - total_baseprice)
-
-    # Create the HTML content for the email
-    html = f"""
-        <html>
-            <head></head>
-            <body>
-                <p>Berikut adalah summarynya:</p>
-                <table border='1'>
-                    <thead>
-                        <tr>
-                            <th>Total Sold</th>
-                            <th>Total Price</th>
-                            <th>Total Baseprice
-     <th>Profit</th>
+    # Create the body of the message (a plain-text and an HTML version).
+    html = """\
+    <html>
+        <head></head>
+        <body>
+            <p>Summary : <br>
+            </p>
+            <table border='1'>
+                <thead>
+                    <tr>
+                        <th>Jumlah Sold</th>
+                        <th>Jumlah Price</th>
+                        <th>Jumlah Baseprice</th>
+                        <th>Keuntungan</th>
                     </tr>
                 </thead>
                 <tbody>
                     <tr>
-                        <td>"""+format_currency(str(total_sold))+"""</td>
-                        <td>"""+format_currency(str(total_price))+"""</td>
-                        <td>"""+format_currency(str(total_baseprice))+"""</td>
+                        <td>"""+format_currency(str(jumlah_sold))+"""</td>
+                        <td>"""+format_currency(str(jumlah_price))+"""</td>
+                        <td>"""+format_currency(str(jumlah_baseprice))+"""</td>
                         <td>"""+format_currency(str(profit))+"""</td>
                     </tr>
                 </tbody>
@@ -116,25 +154,17 @@ def send_email():
     </html>
     """
 
-    #Setup the MIME
     message = MIMEMultipart()
     message['From'] = sender_address
     message['To'] = receiver_address
-    message['Subject'] = 'Summary Profit' # The subject line
-
-    # The body and the attachments for the mail
-    # Record the MIME types of both parts - text/plain and text/html.
+    message['Subject'] = 'Summary Profit' #
     html_content = MIMEText(html, 'html')
 
-    # Attach parts into message container.
-    # According to RFC 2046, the last part of a multipart message, in this case
-    # the HTML message, is best and preferred.
     message.attach(html_content)
 
-    #Create SMTP session for sending the mail
-    session = smtplib.SMTP('smtp.gmail.com', 587) #use gmail with port
-    session.starttls() #enable security
-    session.login(sender_address, appPassword) #login with mail_id and password
+    session = smtplib.SMTP('smtp.gmail.com', 587) 
+    session.starttls() 
+    session.login(sender_address, appPassword)
     text = message.as_string()
     session.sendmail(sender_address, receiver_address, text)
     session.quit()
@@ -143,10 +173,10 @@ def send_email():
 
 default_args = {
     'owner': 'airflow',
-    'start_date': datetime(2023, 4, 7),
+    'start_date': datetime(2023, 5, 9),
 }
 
-with DAG('project_2', default_args=default_args, schedule_interval='@daily') as dag:
+with DAG('project_sales', default_args=default_args, schedule_interval='@daily') as dag:
     
     # Task to upload file to Minio
     upload_file = PythonOperator(
@@ -164,7 +194,7 @@ with DAG('project_2', default_args=default_args, schedule_interval='@daily') as 
         task_id = 'create_table',
         postgres_conn_id = 'postgre_airflow',
         sql = '''
-            create table if not exists project_2 (
+            create table if not exists project_sales (
                 sku VARCHAR NOT NULL PRIMARY KEY,
                 sold INTEGER NOT NULL not null default 0,
                 price INTEGER NOT NULL not null default 0,
